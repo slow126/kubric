@@ -10,6 +10,7 @@ docs/_build
 .hypothesis
 build/
 dist/
+*.deb
 *.egg-info/
 *.blend*
 shapenet2kubric/shapenet2kubric.log
