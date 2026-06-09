@@ -27,6 +27,8 @@ class DollyInConfig:
   camera_direction: Vector3 = (1.0, -1.0, 0.45)
   focal_length: float = 35.0
   sensor_width: float = 32.0
+  camera_motion: str = "dolly"   # "dolly" (forward zoom) | "lateral" (stereo baseline)
+  camera_baseline: float = 0.0   # lateral translation (world units) when camera_motion="lateral"
 
   @property
   def num_frames(self) -> int:
@@ -125,17 +127,45 @@ class StaticDollyInScene:
     self._set_camera_pose(scene, cfg.frame_start)
 
   def keyframe_camera_path(self, scene: kb.Scene) -> None:
-    """Insert dolly-in camera keyframes.
+    """Insert camera keyframes (dolly-in or lateral stereo baseline).
 
     Call this after creating the Blender renderer so the keyframes are mirrored
     onto Blender's camera object.
     """
+    if self.config.camera_motion == "lateral":
+      self._keyframe_lateral_path(scene)
+      return
     cfg = self.config
     visible_span = max(1, cfg.frame_end - cfg.frame_start)
     for frame in range(cfg.frame_start - 1, cfg.frame_end + 2):
       interp = (frame - cfg.frame_start) / visible_span
       interp = float(np.clip(interp, 0.0, 1.0))
       self._set_camera_pose(scene, frame=frame, interp=interp)
+      scene.camera.keyframe_insert("position", frame)
+      scene.camera.keyframe_insert("quaternion", frame)
+
+  def _keyframe_lateral_path(self, scene: kb.Scene) -> None:
+    """Rectified stereo: camera slides along its right axis at fixed distance and
+    fixed (parallel) orientation, producing horizontal-disparity flow."""
+    cfg = self.config
+    direction = np.asarray(cfg.camera_direction, dtype=np.float64)
+    direction = direction / np.linalg.norm(direction)
+    target = np.asarray(cfg.target, dtype=np.float64)
+    base_pos = target + direction * cfg.start_distance
+    # Aim once at the target, then lock orientation for all frames (parallel).
+    scene.camera.position = tuple(float(v) for v in base_pos)
+    scene.camera.look_at(tuple(float(v) for v in target))
+    fixed_quat = tuple(float(q) for q in scene.camera.quaternion)
+    view_dir = target - base_pos
+    view_dir = view_dir / np.linalg.norm(view_dir)
+    right = np.cross(view_dir, np.array([0.0, 0.0, 1.0]))
+    right = right / np.linalg.norm(right)
+    visible_span = max(1, cfg.frame_end - cfg.frame_start)
+    for frame in range(cfg.frame_start - 1, cfg.frame_end + 2):
+      interp = float(np.clip((frame - cfg.frame_start) / visible_span, 0.0, 1.0))
+      pos = base_pos + (interp - 0.5) * cfg.camera_baseline * right
+      scene.camera.position = tuple(float(v) for v in pos)
+      scene.camera.quaternion = fixed_quat
       scene.camera.keyframe_insert("position", frame)
       scene.camera.keyframe_insert("quaternion", frame)
 

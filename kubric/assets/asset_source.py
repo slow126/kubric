@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import difflib
 import functools
 import logging
+import os
 import pathlib
 import shutil
 import tarfile
@@ -26,9 +28,37 @@ import tensorflow as tf
 from typing import Optional, Dict, Any, Type
 import weakref
 
+try:
+  import fcntl  # POSIX-only; used for cross-process asset-cache locking.
+except ImportError:  # pragma: no cover - non-POSIX fallback
+  fcntl = None
+
 from kubric import core
 from kubric import file_io
 from kubric.kubric_typing import PathLike
+
+
+@contextlib.contextmanager
+def _asset_lock(lock_path: pathlib.Path):
+  """Exclusive cross-process lock so concurrent workers fetch an asset once.
+
+  Coordinates parallel render workers (separate processes/containers sharing
+  the asset cache over a bind mount) so they do not download/extract the same
+  asset simultaneously. A no-op where fcntl is unavailable.
+  """
+  if fcntl is None:
+    yield
+    return
+  lock_path.parent.mkdir(parents=True, exist_ok=True)
+  handle = open(lock_path, "w")
+  try:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+      handle.close()
 
 
 class ClosableResource:
@@ -90,7 +120,14 @@ class AssetSource(ClosableResource):
     self.data_dir = file_io.as_path(data_dir)
     logging.info("Created AssetSource '%s' with '%d' assets at URI='%s'",
                  name, len(assets), self.data_dir)
-    self.local_dir = pathlib.Path(tempfile.mkdtemp(prefix=name, dir=scratch_dir))
+    if scratch_dir is not None:
+      # Stable, shared cache keyed by manifest name so every scene/worker/run
+      # reuses one copy of each asset instead of re-downloading per scene.
+      # Concurrency is handled per-asset in fetch() via _asset_lock.
+      self.local_dir = pathlib.Path(scratch_dir) / name
+      self.local_dir.mkdir(parents=True, exist_ok=True)
+    else:
+      self.local_dir = pathlib.Path(tempfile.mkdtemp(prefix=name, dir=scratch_dir))
     self._assets = assets
 
   def close(self):
@@ -217,12 +254,30 @@ class AssetSource(ClosableResource):
     return asset
 
   def fetch(self, asset_path, asset_id):
-    local_path = self.local_dir / (asset_id + ".tar.gz")
-    if not local_path.exists():
-      logging.debug("Copying %s to %s", str(asset_path), str(local_path))
-      local_path.parent.mkdir(parents=True, exist_ok=True)
-      tf.io.gfile.copy(asset_path, local_path)
+    asset_dir = self.local_dir / asset_id
+    done_marker = self.local_dir / (asset_id + ".done")
+    # Fast path: a previous scene/worker already cached and extracted this asset.
+    if done_marker.exists():
+      return asset_dir
 
+    self.local_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = self.local_dir / (asset_id + ".lock")
+    with _asset_lock(lock_path):
+      # Re-check under the lock: another worker may have just finished.
+      if done_marker.exists():
+        return asset_dir
+
+      # Download to a unique temp file then atomically rename, so a partial
+      # download can never be mistaken for a complete archive.
+      local_path = self.local_dir / (asset_id + ".tar.gz")
+      tmp_path = self.local_dir / f"{asset_id}.tar.gz.{os.getpid()}.tmp"
+      logging.debug("Copying %s to %s", str(asset_path), str(local_path))
+      tf.io.gfile.copy(asset_path, str(tmp_path), overwrite=True)
+      os.replace(tmp_path, local_path)
+
+      # Drop any partial extraction left by an earlier crash before extracting.
+      if asset_dir.exists():
+        shutil.rmtree(asset_dir, ignore_errors=True)
       with tarfile.open(local_path, "r:gz") as tar:
         # We support two kinds of archives:
         #  1. flat archives that do not contain any directories
@@ -238,7 +293,11 @@ class AssetSource(ClosableResource):
           tar.extractall(self.local_dir / asset_id)
         logging.debug("Extracted %s", repr([m.name for m in tar.getmembers()]))
 
-    return self.local_dir / asset_id
+      # Extraction succeeded: drop the archive (halves cache size) and mark done.
+      local_path.unlink(missing_ok=True)
+      done_marker.touch()
+
+    return asset_dir
 
   def get_test_split(self, fraction=0.1):
     """

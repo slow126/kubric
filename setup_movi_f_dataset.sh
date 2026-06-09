@@ -87,10 +87,10 @@ echo "Target:     ${target_path}"
 
 mkdir -p "${target_path}"
 
-if command -v gcloud >/dev/null 2>&1; then
-  gcloud storage cp --recursive "${source_path}/*" "${target_path}/"
-elif command -v gsutil >/dev/null 2>&1; then
+if command -v gsutil >/dev/null 2>&1; then
   gsutil -m cp -r "${source_path}/*" "${target_path}/"
+elif command -v gcloud >/dev/null 2>&1; then
+  gcloud storage cp --recursive "${source_path}/*" "${target_path}/"
 else
   echo "Neither gcloud nor gsutil is available." >&2
   echo "Install Google Cloud CLI on the cluster, then rerun this script." >&2
