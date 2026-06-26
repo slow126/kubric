@@ -222,7 +222,7 @@ def _perturb_theta_for_scene(theta: dict[str, Any], scene_seed: int) -> dict[str
   if str(scene_theta.get("camera_motion", "dolly")) == "dolly" \
       and "start_distance" in scene_theta and "end_distance" in scene_theta \
       and scene_theta["end_distance"] >= scene_theta["start_distance"]:
-    scene_theta["end_distance"] = max(0.5, scene_theta["start_distance"] - 0.1)
+    scene_theta["end_distance"] = max(0.5, scene_theta["start_distance"] - float(theta.get("dolly_span", 0.1)))
   return scene_theta
 
 
