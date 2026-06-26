@@ -92,7 +92,10 @@ class MovingAssetDollyInScene(AssetDollyInScene):
     )
     rng = np.random.RandomState(self.config.seed)
     asset_ids = self._select_asset_ids(self.asset_source, rng)
-    positions = self._asset_positions(len(asset_ids))
+    if self.config.spawn_mode == "floor_scatter":
+      positions = self._scatter_floor_positions(len(asset_ids))
+    else:
+      positions = self._asset_positions(len(asset_ids))
 
     num_moving = int(np.clip(self.config.num_moving, 0, len(asset_ids)))
     motion_rng = np.random.RandomState(self.config.seed + 1 + self.config.motion_seed)
@@ -127,6 +130,22 @@ class MovingAssetDollyInScene(AssetDollyInScene):
     if std > 0.0:
       return max(0.0, float(rng.normal(mean, std)))
     return float(mean)
+
+  def _scatter_floor_positions(self, count):
+    """Random grounded (x,y) scatter over spawn_xy_extent with no-overlap
+    rejection sampling, seeded -- MOVi-F-like placement vs the legacy grid."""
+    rng = np.random.RandomState(self.config.seed + 4 + self.config.motion_seed)
+    extent = float(self.config.spawn_xy_extent)
+    min_d2 = (0.75 * float(self.config.asset_scale)) ** 2
+    positions = []
+    for _ in range(count):
+      cand = (float(rng.uniform(-extent, extent)), float(rng.uniform(-extent, extent)))
+      for _attempt in range(200):
+        if all((cand[0]-x)**2 + (cand[1]-y)**2 >= min_d2 for x, y in positions):
+          break
+        cand = (float(rng.uniform(-extent, extent)), float(rng.uniform(-extent, extent)))
+      positions.append(cand)
+    return positions
 
   def _place_asset_in_volume(self, obj: kb.FileBasedObject,
                              rng: np.random.RandomState) -> None:
