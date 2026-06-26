@@ -258,9 +258,12 @@ def render_scenelet(
       target=(0.0, 0.0, target_z),
       camera_direction=_camera_direction(theta),
       focal_length=float(theta.get("focal_length", 35.0)),
+      end_focal_length=float(theta.get("end_focal_length", 0.0)),
       sensor_width=float(theta.get("sensor_width", 32.0)),
       camera_motion=str(theta.get("camera_motion", "dolly")),
       camera_baseline=float(theta.get("camera_baseline", 0.0)),
+      orbit_azimuth_span=float(theta.get("orbit_azimuth_span", 0.0)),
+      orbit_elevation_span=float(theta.get("orbit_elevation_span", 0.0)),
       asset_manifest=manifest,
       seed=int(scene_seed),
       num_assets=int(theta.get("num_assets", 4)),
@@ -282,6 +285,11 @@ def render_scenelet(
         motion_rotation_std=float(theta.get("motion_rotation_std", 0.0)),
         motion_vertical_frac=float(theta.get("motion_vertical_frac", 0.0)),
         motion_seed=int(theta.get("motion_seed", 0)),
+        spawn_mode=str(theta.get("spawn_mode", "floor")),
+        keep_floor=bool(theta.get("keep_floor", True)),
+        spawn_xy_extent=float(theta.get("spawn_xy_extent", 1.8)),
+        spawn_z_min=float(theta.get("spawn_z_min", 0.4)),
+        spawn_z_max=float(theta.get("spawn_z_max", 2.6)),
     )
     builder = MovingAssetDollyInScene(config, asset_scratch_dir=asset_scratch_dir)
   else:
@@ -325,10 +333,16 @@ def render_scenelet(
   if isinstance(builder, MovingAssetDollyInScene):
     builder.keyframe_object_paths(scene)
 
+  # Opt-in: also emit the segmentation pass in full renders so a foreground/background
+  # mask can be derived downstream. Default (False) keeps renders byte-identical.
+  emit_segmentation = bool(theta.get("emit_segmentation", False))
   if geometry_only:
     # Restrict to the geometric passes; no rgba/normal/object_coordinates.
     frames = renderer.render(
         return_layers=("forward_flow", "backward_flow", "segmentation", "depth"))
+  elif emit_segmentation:
+    frames = renderer.render(
+        return_layers=("rgba", "forward_flow", "backward_flow", "segmentation"))
   else:
     # Unchanged full-render path: Blender's default return_layers.
     frames = renderer.render()
@@ -339,6 +353,13 @@ def render_scenelet(
     imageio.imwrite(output_dir / "rgba_00001.png", rgb[1])
   _write_flow_frame(output_dir, "forward_flow", 0, frames["forward_flow"][0])
   _write_flow_frame(output_dir, "backward_flow", 1, frames["backward_flow"][1])
+  if emit_segmentation and "segmentation" in frames:
+    # Segmentation of the TARGET frame (frame 1) -- matches backward_flow_00001 that
+    # KubricInterventionDataset reads. uint16 instance ids; background (no object) = 0.
+    seg = np.asarray(frames["segmentation"])[1]
+    if seg.ndim == 3:
+      seg = seg[..., 0]
+    imageio.imwrite(output_dir / "segmentation_00001.png", seg.astype(np.uint16))
   _write_metadata(scene, output_dir, theta, scene_seed)
 
   if debug_artifacts:

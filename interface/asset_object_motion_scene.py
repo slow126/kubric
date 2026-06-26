@@ -37,6 +37,13 @@ class MovingAssetDollyInConfig(AssetDollyInConfig):
   motion_rotation_std: float = 0.0  # std of per-mover rotation angle (0 => fixed = legacy)
   motion_vertical_frac: float = 0.0  # 0 => grounded slide; >0 allows out-of-plane (in-depth) motion
   motion_seed: int = 0              # decorrelates motion sampling from asset placement
+  # --- FlyingThings-like floating mode (opt-in; defaults reproduce the legacy
+  # grounded-slide behavior exactly, so existing thetas render bit-identically) ---
+  spawn_mode: str = "floor"         # "floor" => grounded slide (legacy); "volume" => float in a 3D box
+  keep_floor: bool = True           # render the ground plane (set False with volume mode for FlyingThings)
+  spawn_xy_extent: float = 1.8      # volume mode: x,y ~ U(-extent, +extent)
+  spawn_z_min: float = 0.4          # volume mode: z ~ U(z_min, z_max)
+  spawn_z_max: float = 2.6
 
 
 class MovingAssetDollyInScene(AssetDollyInScene):
@@ -67,16 +74,17 @@ class MovingAssetDollyInScene(AssetDollyInScene):
     identical, but the first ``num_moving`` assets get ``static = False`` and a
     sampled end-of-scenelet pose recorded for ``keyframe_object_paths``.
     """
-    scene += kb.Cube(
-        name="matte_floor",
-        scale=(8.0, 8.0, 0.05),
-        position=(0.0, 0.0, -0.05),
-        material=kb.PrincipledBSDFMaterial(
-            color=kb.Color(0.55, 0.56, 0.58), roughness=0.9, specular=0.1
-        ),
-        static=True,
-        background=True,
-    )
+    if self.config.keep_floor:
+      scene += kb.Cube(
+          name="matte_floor",
+          scale=(8.0, 8.0, 0.05),
+          position=(0.0, 0.0, -0.05),
+          material=kb.PrincipledBSDFMaterial(
+              color=kb.Color(0.55, 0.56, 0.58), roughness=0.9, specular=0.1
+          ),
+          static=True,
+          background=True,
+      )
 
     self.asset_source = kb.AssetSource.from_manifest(
         self.config.asset_manifest,
@@ -88,13 +96,17 @@ class MovingAssetDollyInScene(AssetDollyInScene):
 
     num_moving = int(np.clip(self.config.num_moving, 0, len(asset_ids)))
     motion_rng = np.random.RandomState(self.config.seed + 1 + self.config.motion_seed)
+    spawn_rng = np.random.RandomState(self.config.seed + 2 + self.config.motion_seed)
 
     self._movers = []
     for idx, (asset_id, position_xy) in enumerate(zip(asset_ids, positions)):
       obj = self.asset_source.create(asset_id=asset_id, name=f"asset_{idx:02d}_{asset_id}")
       assert isinstance(obj, kb.FileBasedObject)
       self._normalize_asset_size(obj)
-      self._place_asset_on_floor(obj, position_xy)
+      if self.config.spawn_mode == "volume":
+        self._place_asset_in_volume(obj, spawn_rng)
+      else:
+        self._place_asset_on_floor(obj, position_xy)
       if self.config.color_assets:
         self._assign_asset_material(obj, rng)
       obj.metadata["asset_smoke_index"] = idx
@@ -116,6 +128,22 @@ class MovingAssetDollyInScene(AssetDollyInScene):
       return max(0.0, float(rng.normal(mean, std)))
     return float(mean)
 
+  def _place_asset_in_volume(self, obj: kb.FileBasedObject,
+                             rng: np.random.RandomState) -> None:
+    """Float a mover at a uniformly-random position in a fixed 3-D box.
+
+    Unlike ``_place_asset_on_floor`` the object is not grounded, so together with
+    ``spawn_mode='volume'`` (which drops the anti-sink clamp) each mover can move
+    downward as well as up. The box is deliberately *not* a search parameter --
+    FlyingThings randomizes initial positions, it does not tune a spawn box -- so
+    the bounds are fixed config defaults, drawn fresh per scene and per object."""
+    cfg = self.config
+    obj.position = (
+        float(rng.uniform(-cfg.spawn_xy_extent, cfg.spawn_xy_extent)),
+        float(rng.uniform(-cfg.spawn_xy_extent, cfg.spawn_xy_extent)),
+        float(rng.uniform(cfg.spawn_z_min, cfg.spawn_z_max)),
+    )
+
   def _prepare_object_motion(self, obj: kb.FileBasedObject, rng: np.random.RandomState) -> None:
     """Sample a rigid end pose for one mover and record it for keyframing."""
     start_pos = np.asarray(obj.position, dtype=np.float64)
@@ -133,8 +161,11 @@ class MovingAssetDollyInScene(AssetDollyInScene):
     trans_mag = self._sample_magnitude(
         rng, self.config.motion_translation, self.config.motion_translation_std)
     end_pos = start_pos + direction * trans_mag
-    # Keep grounded objects from sinking below the floor.
-    end_pos[2] = max(end_pos[2], float(start_pos[2]))
+    if self.config.spawn_mode != "volume":
+      # Keep grounded objects from sinking below the floor. Floating movers
+      # (volume mode) are free to descend -- that is what lets object motion
+      # alone produce downward flow instead of recruiting a camera dolly.
+      end_pos[2] = max(end_pos[2], float(start_pos[2]))
 
     # Rotation: per-mover angle magnitude about a random axis.
     axis = rng.normal(size=3)

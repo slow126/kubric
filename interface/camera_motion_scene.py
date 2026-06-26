@@ -26,9 +26,12 @@ class DollyInConfig:
   target: Vector3 = (0.0, 0.0, 0.8)
   camera_direction: Vector3 = (1.0, -1.0, 0.45)
   focal_length: float = 35.0
+  end_focal_length: float = 0.0   # if >0: keyframe focal_length -> end_focal_length over the visible frames (pure magnification zoom, NO camera translation -> no parallax/disocclusion)
   sensor_width: float = 32.0
-  camera_motion: str = "dolly"   # "dolly" (forward zoom) | "lateral" (stereo baseline)
+  camera_motion: str = "dolly"   # "dolly" (forward zoom) | "lateral" (stereo baseline) | "orbit" (arc around target)
   camera_baseline: float = 0.0   # lateral translation (world units) when camera_motion="lateral"
+  orbit_azimuth_span: float = 0.0    # radians swept in azimuth for camera_motion="orbit" (pi ~= 180-deg multi-view sweep)
+  orbit_elevation_span: float = 0.0  # radians swept in elevation for camera_motion="orbit"
 
   @property
   def num_frames(self) -> int:
@@ -132,8 +135,12 @@ class StaticDollyInScene:
     Call this after creating the Blender renderer so the keyframes are mirrored
     onto Blender's camera object.
     """
+    self._keyframe_focal(scene)  # focal zoom (if end_focal_length>0); independent of camera path
     if self.config.camera_motion == "lateral":
       self._keyframe_lateral_path(scene)
+      return
+    if self.config.camera_motion == "orbit":
+      self._keyframe_orbit_path(scene)
       return
     cfg = self.config
     visible_span = max(1, cfg.frame_end - cfg.frame_start)
@@ -143,6 +150,21 @@ class StaticDollyInScene:
       self._set_camera_pose(scene, frame=frame, interp=interp)
       scene.camera.keyframe_insert("position", frame)
       scene.camera.keyframe_insert("quaternion", frame)
+
+  def _keyframe_focal(self, scene: kb.Scene) -> None:
+    """Keyframe the camera focal_length from focal_length -> end_focal_length over
+    the visible frames. Pure magnification (no camera translation), so it produces
+    a radial zoom flow WITHOUT parallax or disocclusion -- the 3D analog of an
+    occlusion-free warp. No-op unless end_focal_length>0 and differs from focal_length."""
+    cfg = self.config
+    end_fl = float(getattr(cfg, "end_focal_length", 0.0) or 0.0)
+    if end_fl <= 0.0 or end_fl == cfg.focal_length:
+      return
+    visible_span = max(1, cfg.frame_end - cfg.frame_start)
+    for frame in range(cfg.frame_start - 1, cfg.frame_end + 2):
+      interp = float(np.clip((frame - cfg.frame_start) / visible_span, 0.0, 1.0))
+      scene.camera.focal_length = (1.0 - interp) * cfg.focal_length + interp * end_fl
+      scene.camera.keyframe_insert("focal_length", frame)
 
   def _keyframe_lateral_path(self, scene: kb.Scene) -> None:
     """Rectified stereo: camera slides along its right axis at fixed distance and
@@ -166,6 +188,34 @@ class StaticDollyInScene:
       pos = base_pos + (interp - 0.5) * cfg.camera_baseline * right
       scene.camera.position = tuple(float(v) for v in pos)
       scene.camera.quaternion = fixed_quat
+      scene.camera.keyframe_insert("position", frame)
+      scene.camera.keyframe_insert("quaternion", frame)
+
+  def _keyframe_orbit_path(self, scene: kb.Scene) -> None:
+    """Camera arcs along the sphere around the target, re-aiming at it each frame.
+
+    Sweeps azimuth/elevation by ``orbit_azimuth_span``/``orbit_elevation_span``
+    over the visible frames at fixed distance (or a spiral if start/end differ),
+    producing multi-view / rotational flow rather than the radial field of a
+    forward dolly. Uses the same azimuth/elevation -> direction convention as
+    ``_camera_direction``: [cos(az)cos(el), sin(az)cos(el), sin(el)]."""
+    cfg = self.config
+    target = np.asarray(cfg.target, dtype=np.float64)
+    d = np.asarray(cfg.camera_direction, dtype=np.float64)
+    d = d / np.linalg.norm(d)
+    el0 = float(np.arcsin(np.clip(d[2], -1.0, 1.0)))   # recover base elevation
+    az0 = float(np.arctan2(d[1], d[0]))                # recover base azimuth
+    visible_span = max(1, cfg.frame_end - cfg.frame_start)
+    for frame in range(cfg.frame_start - 1, cfg.frame_end + 2):
+      interp = float(np.clip((frame - cfg.frame_start) / visible_span, 0.0, 1.0))
+      az = az0 + interp * cfg.orbit_azimuth_span
+      el = el0 + interp * cfg.orbit_elevation_span
+      direction = np.array([np.cos(az) * np.cos(el),
+                            np.sin(az) * np.cos(el),
+                            np.sin(el)], dtype=np.float64)
+      distance = (1.0 - interp) * cfg.start_distance + interp * cfg.end_distance
+      scene.camera.position = tuple(float(v) for v in (target + direction * distance))
+      scene.camera.look_at(tuple(float(v) for v in target))
       scene.camera.keyframe_insert("position", frame)
       scene.camera.keyframe_insert("quaternion", frame)
 
